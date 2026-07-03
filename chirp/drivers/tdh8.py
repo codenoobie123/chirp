@@ -520,6 +520,56 @@ struct{
 
 """
 
+MEM_FORMAT_H9 = """
+#seekto 0x0018;
+struct {
+  lbcd rxfreq[4];
+  lbcd txfreq[4];
+  lbcd rxtone[2];
+  lbcd txtone[2];
+  u8 lowpower:2,
+     wide:1,
+     unknown1:5;
+  u8 unknown2:2,
+     unknown_2000:1,
+     unknown3:2,
+     unknown4:2,
+     scanadd:1;
+  u8 unknown5;
+  u8 unknown6;
+} memory[199];
+
+#seekto 0x0CA8;
+struct {
+  u8 txled:1,
+     rxled:1,
+     unknown_a5:4,
+     dtmfst:1,
+     unknown_a0:1;
+  u8 unknown_b7:1,
+     voiceprompt:1,
+     unknown_b5:3,
+     btnvoice:1,
+     unknown_b1:1,
+     tailclean:1;
+  u8 unknown_c;
+  u8 unknown_d7:5,
+     dbrx:1,
+     unknown_d1:2;
+  u8 unknown_e[5];
+  u8 squelch;
+  u8 tot;
+  u8 unknown_f1:1,
+     rogerprompt:1,
+     unknown_f2:6;
+} settings;
+
+#seekto 0x0D48;
+struct {
+  char name[8];
+} names[199];
+"""
+
 MEM_FORMAT_RT730 = """
 #seekto 0x0008;
 struct {
@@ -785,15 +835,19 @@ TIMEOUT730_LIST = ["Off"] + ["%s sec" % x for x in range(30, 240, 30)]
 MIC_GAIN_LIST = ['%s' % x for x in range(0, 10)]
 H8_LIST = ["TD-H8", "TD-H8-HAM", "TD-H8-GMRS"]
 H3_LIST = ["TD-H3", "TD-H3-HAM", "TD-H3-GMRS"]
+H9_LIST = ["TD-H9", "TD-H9-HAM", "TD-H9-GMRS"]
 
 GMRS_FREQS = bandplan_na.ALL_GMRS_FREQS
 
-ALL_MODEL = H8_LIST + H3_LIST + ["RT-730"]
+ALL_MODEL = H8_LIST + H3_LIST + H9_LIST + ["RT-730"]
 
 TD_H8 = b'PVOJH\x1c\x14'
 TD_H3 = b'PVOJH\x5c\x14'
 RT_730 = b'PGOJH\xc3D'
 TD_H8_G3 = b'PVOJH<\x14'
+# Ident returned by TD-H9 hardware; trailing byte encodes firmware mode:
+#   \x4e ('N') = Normal, \x48 ('H') = HAM, \x47 ('G') = GMRS
+TD_H9 = b'TDH9\xff\xff\xff\x4e'
 
 
 def _do_status(radio, block):
@@ -2733,6 +2787,300 @@ class TDH8_3rd_Gen_GMRS(TDH8_3rd_Gen):
     ident_mode = b'P31184\xff\xff'
     _gmrs = True
     _txbands = [(136000000, 175000000), (400000000, 521000000)]
+
+    def validate_memory(self, mem):
+        msgs = super().validate_memory(mem)
+        if 31 <= mem.number <= 54 and mem.freq not in GMRS_FREQS:
+            msgs.append(chirp_common.ValidationError(
+                "The frequency in channels 31-54 must be between "
+                "462.55000-462.72500 in 0.025 increments."))
+        if mem.duplex not in ('', '+', 'off') or (
+                mem.duplex == '+' and mem.offset != 5000000):
+            msgs.append(chirp_common.ValidationError(
+                "Channels in this range must be GMRS frequencies and "
+                "either simplex or +5MHz offset"))
+        return msgs
+
+
+TOT_H9_LIST = ["Off", "30S", "60S", "90S", "120S", "3Min", "5Min", "10Min"]
+
+
+@directory.register
+class TDH9(TDH3):
+    """TIDRADIO TD-H9 (Normal firmware, USB-C 115200 baud)"""
+    VENDOR = "TIDRADIO"
+    MODEL = "TD-H9"
+    BAUD_RATE = 115200
+    MODES = ["FM", "NFM", "AM"]
+    _memsize = 0x3124
+    _ranges_main = [(0x0000, 0x3124)]
+    ident_mode = TD_H9
+    _txbands = [(136000000, 175000000), (400000000, 521000000)]
+    _rxbands = [(87000000, 108000000), (108000000, 136000000)]
+    _tx_power = [chirp_common.PowerLevel("High", watts=10.0),
+                 chirp_common.PowerLevel("Low",  watts=1.0),
+                 chirp_common.PowerLevel("Mid",  watts=5.0)]
+    _ham = False
+    _gmrs = False
+
+    @classmethod
+    def get_prompts(cls):
+        rp = chirp_common.RadioPrompts()
+        rp.pre_download = (dedent("""\
+            1. Turn the radio on.
+            2. Connect the radio via USB-C.
+            3. The radio should appear as a COM port.
+            4. Click OK to download."""))
+        rp.pre_upload = (dedent("""\
+            1. Turn the radio on.
+            2. Connect the radio via USB-C.
+            3. The radio should appear as a COM port.
+            4. Click OK to upload."""))
+        return rp
+
+    def process_mmap(self):
+        self._memobj = bitwise.parse(MEM_FORMAT_H9, self._mmap)
+
+    def get_features(self):
+        rf = super().get_features()
+        rf.has_nostep_tuning = True
+        rf.valid_tuning_steps = [2.5, 5.0, 6.25, 10.0, 12.5,
+                                 15.0, 20.0, 25.0, 50.0]
+        rf.valid_bands = sorted(self._txbands + self._rxbands)
+        rf.valid_power_levels = self._tx_power
+        rf.valid_modes = self.MODES
+        rf.memory_bounds = (1, 199)
+        return rf
+
+    def get_memory(self, number):
+        _mem = self._memobj.memory[number - 1]
+        _nam = self._memobj.names[number - 1]
+        mem = chirp_common.Memory()
+        mem.number = number
+
+        if (int(_mem.rxfreq) == 0 or
+                _mem.rxfreq.get_raw() == b'\xff\xff\xff\xff'):
+            mem.empty = True
+            return mem
+
+        mem.freq = int(_mem.rxfreq) * 10
+
+        if _mem.txfreq.get_raw() == b'\xff\xff\xff\xff':
+            mem.duplex = 'off'
+            mem.offset = 0
+        else:
+            chirp_common.split_to_offset(mem,
+                                         int(_mem.rxfreq) * 10,
+                                         int(_mem.txfreq) * 10)
+
+        if chirp_common.in_range(mem.freq, [(108000000, 135999999)]):
+            mem.mode = 'AM'
+        elif _mem.wide:
+            mem.mode = 'NFM'
+        else:
+            mem.mode = 'FM'
+
+        try:
+            mem.power = self._tx_power[int(_mem.lowpower)]
+        except IndexError:
+            mem.power = self._tx_power[0]
+
+        name = ""
+        for char in _nam.name:
+            c = str(char)
+            if c in ('\x00', '\xff'):
+                break
+            name += c
+        mem.name = name.rstrip()
+
+        rxtone = self._decode_tone(int(_mem.rxtone))
+        txtone = self._decode_tone(int(_mem.txtone))
+        chirp_common.split_tone_decode(mem, txtone, rxtone)
+
+        mem.skip = '' if _mem.scanadd else 'S'
+
+        return mem
+
+    def set_memory(self, mem):
+        _mem = self._memobj.memory[mem.number - 1]
+        _nam = self._memobj.names[mem.number - 1]
+
+        if mem.empty:
+            _mem.fill_raw(b'\x00')
+            _mem.rxtone[0].set_raw(0xFF)
+            _mem.rxtone[1].set_raw(0xFF)
+            _mem.txtone[0].set_raw(0xFF)
+            _mem.txtone[1].set_raw(0xFF)
+            return
+
+        _mem.fill_raw(b'\x00')
+        _mem.rxfreq = mem.freq / 10
+
+        if mem.duplex == '':
+            _mem.txfreq = mem.freq / 10
+        elif mem.duplex == 'split':
+            _mem.txfreq = mem.offset / 10
+        elif mem.duplex == '+':
+            _mem.txfreq = (mem.freq + mem.offset) / 10
+        elif mem.duplex == '-':
+            _mem.txfreq = (mem.freq - mem.offset) / 10
+        elif mem.duplex == 'off':
+            _mem.txfreq.fill_raw(b'\xFF')
+        else:
+            _mem.txfreq = mem.freq / 10
+
+        _mem.wide = 1 if mem.mode == 'NFM' else 0
+
+        try:
+            _mem.lowpower = self._tx_power.index(
+                mem.power or self._tx_power[0])
+        except ValueError:
+            _mem.lowpower = 0
+
+        for i in range(8):
+            try:
+                _nam.name[i] = mem.name[i]
+            except IndexError:
+                _nam.name[i] = '\x00'
+
+        txtone, rxtone = chirp_common.split_tone_encode(mem)
+        self._encode_tone(_mem.txtone, *txtone)
+        self._encode_tone(_mem.rxtone, *rxtone)
+
+        _mem.scanadd = 1 if mem.skip != 'S' else 0
+        _mem.unknown_2000 = 1
+
+    def get_settings(self):
+        try:
+            return self._get_settings()
+        except Exception as e:
+            raise InvalidValueError("Settings read failed: %s" % e) from e
+
+    def _get_settings(self):
+        s = self._memobj.settings
+        basic = RadioSettingGroup("basic", "Basic Settings")
+        group = RadioSettings(basic)
+
+        basic.append(RadioSetting(
+            "squelch", "Squelch Level",
+            RadioSettingValueList(
+                [str(x) for x in range(0, 10)],
+                current_index=int(s.squelch))))
+        basic.append(RadioSetting(
+            "tot", "Time-Out Timer",
+            RadioSettingValueList(
+                TOT_H9_LIST, current_index=int(s.tot))))
+        basic.append(RadioSetting(
+            "btnvoice", "Key Beep",
+            RadioSettingValueBoolean(bool(s.btnvoice))))
+        basic.append(RadioSetting(
+            "rogerprompt", "Roger Beep",
+            RadioSettingValueBoolean(bool(s.rogerprompt))))
+        basic.append(RadioSetting(
+            "dbrx", "Dual Watch",
+            RadioSettingValueBoolean(bool(s.dbrx))))
+        basic.append(RadioSetting(
+            "txled", "TX Screen",
+            RadioSettingValueBoolean(bool(s.txled))))
+        basic.append(RadioSetting(
+            "rxled", "RX Screen",
+            RadioSettingValueBoolean(bool(s.rxled))))
+        basic.append(RadioSetting(
+            "dtmfst", "DTMF Sidetone",
+            RadioSettingValueBoolean(bool(s.dtmfst))))
+        basic.append(RadioSetting(
+            "voiceprompt", "Voice Announce",
+            RadioSettingValueBoolean(bool(s.voiceprompt))))
+        basic.append(RadioSetting(
+            "tailclean", "Tail Eliminate",
+            RadioSettingValueBoolean(bool(s.tailclean))))
+        return group
+
+    def set_settings(self, settings):
+        s = self._memobj.settings
+        for element in settings:
+            if not isinstance(element, RadioSetting):
+                self.set_settings(element)
+                continue
+            try:
+                name = element.get_name()
+                if name == "squelch":
+                    s.squelch = int(element.value)
+                elif name == "tot":
+                    s.tot = TOT_H9_LIST.index(str(element.value))
+                elif name == "btnvoice":
+                    s.btnvoice = bool(element.value)
+                elif name == "rogerprompt":
+                    s.rogerprompt = bool(element.value)
+                elif name == "dbrx":
+                    s.dbrx = bool(element.value)
+                elif name == "txled":
+                    s.txled = bool(element.value)
+                elif name == "rxled":
+                    s.rxled = bool(element.value)
+                elif name == "dtmfst":
+                    s.dtmfst = bool(element.value)
+                elif name == "voiceprompt":
+                    s.voiceprompt = bool(element.value)
+                elif name == "tailclean":
+                    s.tailclean = bool(element.value)
+                else:
+                    LOG.warning("Unknown setting: %s", name)
+            except Exception:
+                LOG.debug("Failed to set %s", element.get_name(),
+                          exc_info=True)
+                raise
+
+    def get_tx_bands(self):
+        return self._txbands
+
+    def validate_memory(self, mem):
+        msgs = []
+        airband = (108000000, 135999999)
+        if chirp_common.in_range(mem.freq, [airband]) and mem.mode != 'AM':
+            msgs.append(chirp_common.ValidationWarning(
+                _('Frequency in this range requires AM mode')))
+        if (not chirp_common.in_range(mem.freq, [airband]) and
+                mem.mode == 'AM'):
+            msgs.append(chirp_common.ValidationWarning(
+                _('Frequency in this range must not be AM mode')))
+        if (not chirp_common.in_range(mem.freq, self._txbands) and
+                mem.duplex != 'off'):
+            msgs.append(chirp_common.ValidationError(
+                'Frequency outside TX bands; set duplex=off for RX only'))
+        return msgs + chirp_common.CloneModeRadio.validate_memory(self, mem)
+
+
+@directory.register
+@directory.detected_by(TDH9)
+class TDH9_HAM(TDH9):
+    """TIDRADIO TD-H9 (HAM firmware)"""
+    MODEL = "TD-H9-HAM"
+    ident_mode = b'TDH9\xff\xff\xffH'
+    _txbands = [(136000000, 174000000), (220000000, 260000000),
+                (350000000, 390000000), (400000000, 520000000)]
+    _rxbands = [(87000000, 108000000), (108000000, 136000000)]
+    _ham = True
+
+
+@directory.register
+@directory.detected_by(TDH9)
+class TDH9_GMRS(TDH9):
+    """TIDRADIO TD-H9 (GMRS firmware)"""
+    MODEL = "TD-H9-GMRS"
+    ident_mode = b'TDH9\xff\xff\xffG'
+    _gmrs = True
+    _txbands = [(462000000, 468000000)]
+    _rxbands = [(87000000, 108000000),
+                (108000000, 136000000),
+                (136000000, 174000000),
+                (240000000, 260000000),
+                (350000000, 370000000),
+                (400000000, 462000000),
+                (468000000, 520000000)]
+    _tx_power = [chirp_common.PowerLevel("High", watts=5.0),
+                 chirp_common.PowerLevel("Low",  watts=1.0),
+                 chirp_common.PowerLevel("Mid",  watts=2.5)]
 
     def validate_memory(self, mem):
         msgs = super().validate_memory(mem)
